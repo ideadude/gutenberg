@@ -1,5 +1,3 @@
-sudo: required
-
 dist: trusty
 
 language: php
@@ -14,27 +12,28 @@ notifications:
 
 cache:
   directories:
-    - vendor
     - $HOME/.composer/cache
     - $HOME/.phpbrew
+    - $HOME/.npm
 
 before_install:
   - nvm install && nvm use
+  - npm install npm -g
+
+branches:
+  only:
+    - master
 
 jobs:
   include:
     - stage: test
-      php: 5.6
-      script: composer install && ./vendor/bin/phpcs
-
-    - stage: test
+      env: WP_VERSION=latest
       script:
         - npm install || exit 1
         - npm run ci || exit 1
 
     - stage: test
-      php: 7.1
-      env: WP_VERSION=latest
+      env: WP_VERSION=latest DOCKER=true
       script:
         - ./bin/run-wp-unit-tests.sh
 
@@ -59,7 +58,11 @@ jobs:
         - ./bin/run-wp-unit-tests.sh
 
     - stage: test
+      env: WP_VERSION=latest
       script:
-        - npm install || exit 1
-        - npm run build || exit 1
+        - ./bin/run-e2e-tests.sh || exit 1
+
+    - stage: test
+      env: WP_VERSION=latest E2E_ROLE=author
+      script:
         - ./bin/run-e2e-tests.sh || exit 1

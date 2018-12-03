@@ -70,75 +70,22 @@ function _gutenberg_utf8_split( $str ) {
 }
 
 /**
- * Fixes a conflict with the Jetpack plugin trying to read an undefined global
- * variable `grunionEditorView` during the initialization of the
- * `core/freeform` block.
- *
- * @since 0.7.1
- */
-function gutenberg_fix_jetpack_freeform_block_conflict() {
-	if (
-		defined( 'JETPACK__VERSION' ) &&
-		version_compare( JETPACK__VERSION, '5.2.2', '<' )
-	) {
-		remove_filter(
-			'mce_external_plugins',
-			array( 'Grunion_Editor_View', 'mce_external_plugins' )
-		);
-	}
-}
-
-/**
- * Shims wp-api-request for WordPress installations not running 4.9-alpha or
- * newer.
- *
- * @see https://core.trac.wordpress.org/ticket/40919
- *
- * @since 0.10.0
- */
-function gutenberg_ensure_wp_api_request() {
-	if ( wp_script_is( 'wp-api-request', 'registered' ) ||
-			! wp_script_is( 'wp-api-request-shim', 'registered' ) ) {
-		return;
-	}
-
-	global $wp_scripts;
-
-	// Define script using existing shim. We do this because we must define the
-	// vendor script in client-assets.php, but want to use consistent handle.
-	$shim = $wp_scripts->registered['wp-api-request-shim'];
-	wp_register_script(
-		'wp-api-request',
-		$shim->src,
-		$shim->deps,
-		$shim->ver
-	);
-
-	// Localize wp-api-request using wp-api handle data (swapped in 4.9-alpha).
-	$wp_api_localized_data = $wp_scripts->get_data( 'wp-api', 'data' );
-	if ( false !== $wp_api_localized_data ) {
-		wp_add_inline_script( 'wp-api-request', $wp_api_localized_data, 'before' );
-	}
-}
-add_action( 'wp_enqueue_scripts', 'gutenberg_ensure_wp_api_request', 20 );
-add_action( 'admin_enqueue_scripts', 'gutenberg_ensure_wp_api_request', 20 );
-
-/**
  * Disables wpautop behavior in classic editor when post contains blocks, to
  * prevent removep from invalidating paragraph blocks.
  *
- * @param  array $settings Original editor settings.
- * @return array           Filtered settings.
+ * @param  array  $settings  Original editor settings.
+ * @param  string $editor_id ID for the editor instance.
+ * @return array             Filtered settings.
  */
-function gutenberg_disable_editor_settings_wpautop( $settings ) {
+function gutenberg_disable_editor_settings_wpautop( $settings, $editor_id ) {
 	$post = get_post();
-	if ( is_object( $post ) && gutenberg_post_has_blocks( $post ) ) {
+	if ( 'content' === $editor_id && is_object( $post ) && has_blocks( $post ) ) {
 		$settings['wpautop'] = false;
 	}
 
 	return $settings;
 }
-add_filter( 'wp_editor_settings', 'gutenberg_disable_editor_settings_wpautop' );
+add_filter( 'wp_editor_settings', 'gutenberg_disable_editor_settings_wpautop', 10, 2 );
 
 /**
  * Add rest nonce to the heartbeat response.
@@ -150,44 +97,211 @@ function gutenberg_add_rest_nonce_to_heartbeat_response_headers( $response ) {
 	$response['rest-nonce'] = wp_create_nonce( 'wp_rest' );
 	return $response;
 }
-
 add_filter( 'wp_refresh_nonces', 'gutenberg_add_rest_nonce_to_heartbeat_response_headers' );
 
 /**
- * Ensure that the wp-json index contains the `permalink_structure` setting as
- * part of its site info elements.
+ * Check if we need to load the block warning in the Classic Editor.
  *
- * @see https://core.trac.wordpress.org/ticket/42465
- *
- * @param WP_REST_Response $response WP REST API response of the wp-json index.
- * @return WP_REST_Response Response that contains the permalink structure.
+ * @since 3.4.0
  */
-function gutenberg_ensure_wp_json_has_permalink_structure( $response ) {
-	$site_info = $response->get_data();
+function gutenberg_check_if_classic_needs_warning_about_blocks() {
+	global $pagenow;
 
-	if ( ! array_key_exists( 'permalink_structure', $site_info ) ) {
-		$site_info['permalink_structure'] = get_option( 'permalink_structure' );
+	if ( ! in_array( $pagenow, array( 'post.php', 'post-new.php' ), true ) || ! isset( $_REQUEST['classic-editor'] ) ) {
+		return;
 	}
 
-	$response->set_data( $site_info );
+	$post = get_post();
+	if ( ! $post ) {
+		return;
+	}
 
-	return $response;
+	if ( ! has_blocks( $post ) ) {
+		return;
+	}
+
+	// Enqueue the JS we're going to need in the dialog.
+	wp_enqueue_script( 'wp-a11y' );
+	wp_enqueue_script( 'wp-sanitize' );
+
+	add_action( 'admin_footer', 'gutenberg_warn_classic_about_blocks' );
 }
-add_filter( 'rest_index', 'gutenberg_ensure_wp_json_has_permalink_structure' );
+add_action( 'admin_enqueue_scripts', 'gutenberg_check_if_classic_needs_warning_about_blocks' );
 
 /**
- * As a substitute for the default content `wpautop` filter, applies autop
- * behavior only for posts where content does not contain blocks.
+ * Adds a warning to the Classic Editor when trying to edit a post containing blocks.
  *
- * @param  string $content Post content.
- * @return string          Paragraph-converted text if non-block content.
+ * @since 3.4.0
  */
-function gutenberg_wpautop( $content ) {
-	if ( gutenberg_content_has_blocks( $content ) ) {
-		return $content;
-	}
+function gutenberg_warn_classic_about_blocks() {
+	$post = get_post();
 
-	return wpautop( $content );
+	$gutenberg_edit_link = get_edit_post_link( $post->ID, 'raw' );
+
+	$classic_edit_link = $gutenberg_edit_link;
+	$classic_edit_link = add_query_arg(
+		array(
+			'classic-editor'     => '',
+			'hide-block-warning' => '',
+		),
+		$classic_edit_link
+	);
+
+	$revisions_link = '';
+	if ( wp_revisions_enabled( $post ) ) {
+		$revisions = wp_get_post_revisions( $post );
+
+		// If there's only one revision, that won't help.
+		if ( count( $revisions ) > 1 ) {
+			reset( $revisions ); // Reset pointer for key().
+			$revisions_link = get_edit_post_link( key( $revisions ) );
+		}
+	}
+	?>
+		<style type="text/css">
+			#blocks-in-post-dialog .notification-dialog {
+				position: fixed;
+				top: 50%;
+				left: 50%;
+				width: 500px;
+				box-sizing: border-box;
+				transform: translate(-50%, -50%);
+				margin: 0;
+				padding: 25px;
+				max-height: 90%;
+				background: #fff;
+				box-shadow: 0 3px 6px rgba(0, 0, 0, 0.3);
+				line-height: 1.5;
+				z-index: 1000005;
+				overflow-y: auto;
+			}
+
+			@media only screen and (max-height: 480px), screen and (max-width: 450px) {
+				#blocks-in-post-dialog .notification-dialog {
+					top: 0;
+					left: 0;
+					width: 100%;
+					height: 100%;
+					transform: none;
+					max-height: 100%;
+				}
+			}
+		</style>
+
+		<div id="blocks-in-post-dialog" class="notification-dialog-wrap">
+			<div class="notification-dialog-background"></div>
+			<div class="notification-dialog">
+				<div class="blocks-in-post-message">
+					<p><?php _e( 'This post was previously edited in Gutenberg. You can continue in the Classic Editor, but you may lose data and formatting.', 'gutenberg' ); ?></p>
+					<?php
+					if ( $revisions_link ) {
+						?>
+							<p>
+							<?php
+								/* translators: link to the post revisions page */
+								printf( __( 'You can also <a href="%s">browse previous revisions</a> and restore a version of the post before it was edited in Gutenberg.', 'gutenberg' ), esc_url( $revisions_link ) );
+							?>
+							</p>
+						<?php
+					} else {
+						?>
+							<p><strong><?php _e( 'Because this post does not have revisions, you will not be able to revert any changes you make in the Classic Editor.', 'gutenberg' ); ?></strong></p>
+						<?php
+					}
+					?>
+				</div>
+				<p>
+					<a class="button button-primary blocks-in-post-gutenberg-button" href="<?php echo esc_url( $gutenberg_edit_link ); ?>"><?php _e( 'Edit in Gutenberg', 'gutenberg' ); ?></a>
+					<button type="button" class="button blocks-in-post-classic-button"><?php _e( 'Continue to Classic Editor', 'gutenberg' ); ?></button>
+				</p>
+			</div>
+		</div>
+
+		<script type="text/javascript">
+			/* <![CDATA[ */
+			( function( $ ) {
+				var dialog = {};
+
+				dialog.init = function() {
+					// The modal
+					dialog.warning = $( '#blocks-in-post-dialog' );
+					// Get the links and buttons within the modal.
+					dialog.warningTabbables = dialog.warning.find( 'a, button' );
+
+					// Get the text within the modal.
+					dialog.rawMessage = dialog.warning.find( '.blocks-in-post-message' ).text();
+
+					// Hide all the #wpwrap content from assistive technologies.
+					$( '#wpwrap' ).attr( 'aria-hidden', 'true' );
+
+					// Detach the warning modal from its position and append it to the body.
+					$( document.body )
+						.addClass( 'modal-open' )
+						.append( dialog.warning.detach() );
+
+					// Reveal the modal and set focus on the Gutenberg button.
+					dialog.warning
+						.removeClass( 'hidden' )
+						.find( '.blocks-in-post-gutenberg-button' ).focus();
+
+					// Attach event handlers.
+					dialog.warningTabbables.on( 'keydown', dialog.constrainTabbing );
+					dialog.warning.on( 'click', '.blocks-in-post-classic-button', dialog.dismissWarning );
+
+					// Make screen readers announce the warning message after a short delay (necessary for some screen readers).
+					setTimeout( function() {
+						wp.a11y.speak( wp.sanitize.stripTags( dialog.rawMessage.replace( /\s+/g, ' ' ) ), 'assertive' );
+					}, 1000 );
+				};
+
+				dialog.constrainTabbing = function( event ) {
+					var firstTabbable, lastTabbable;
+
+					if ( 9 !== event.which ) {
+						return;
+					}
+
+					firstTabbable = dialog.warningTabbables.first()[0];
+					lastTabbable = dialog.warningTabbables.last()[0];
+
+					if ( lastTabbable === event.target && ! event.shiftKey ) {
+						firstTabbable.focus();
+						event.preventDefault();
+					} else if ( firstTabbable === event.target && event.shiftKey ) {
+						lastTabbable.focus();
+						event.preventDefault();
+					}
+				};
+
+				dialog.dismissWarning = function() {
+					// Hide modal.
+					dialog.warning.remove();
+					$( '#wpwrap' ).removeAttr( 'aria-hidden' );
+					$( 'body' ).removeClass( 'modal-open' );
+				};
+
+				$( document ).ready( dialog.init );
+			} )( jQuery );
+			/* ]]> */
+		</script>
+	<?php
 }
-remove_filter( 'the_content', 'wpautop' );
-add_filter( 'the_content', 'gutenberg_wpautop' );
+
+/**
+ * Display the privacy policy help notice.
+ *
+ * In Gutenberg, the `edit_form_after_title` hook is not supported. Because
+ * WordPress Core uses this hook to display this notice, it never displays.
+ * Outputting the notice on the `admin_notices` hook allows Gutenberg to
+ * consume the notice and display it with the Notices API.
+ *
+ * @since 4.5.0
+ */
+function gutenberg_show_privacy_policy_help_text() {
+	if ( is_gutenberg_page() && has_action( 'edit_form_after_title', array( 'WP_Privacy_Policy_Content', 'notice' ) ) ) {
+		remove_action( 'edit_form_after_title', array( 'WP_Privacy_Policy_Content', 'notice' ) );
+
+		WP_Privacy_Policy_Content::notice( get_post() );
+	}
+}
+add_action( 'admin_notices', 'gutenberg_show_privacy_policy_help_text' );
